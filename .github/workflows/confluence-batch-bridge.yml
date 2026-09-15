@@ -1,0 +1,119 @@
+name: Confluence Batch Attachment Bridge
+
+on:
+  push:
+    paths:
+      - 'confluence-batch-requests/*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  download-confluence-attachments:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve batch request
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUEST_FILE="$(git diff --name-only HEAD^ HEAD -- 'confluence-batch-requests/*.json' | tail -n 1)"
+          if [[ -z "$REQUEST_FILE" || ! -f "$REQUEST_FILE" ]]; then
+            echo 'No Confluence batch request JSON found.' >&2
+            exit 1
+          fi
+          CONTENT_ID="$(jq -r '.contentId // empty' "$REQUEST_FILE")"
+          if [[ ! "$CONTENT_ID" =~ ^[0-9]+$ ]]; then
+            echo 'contentId must be numeric.' >&2
+            exit 1
+          fi
+          COUNT="$(jq '.attachmentIds | length' "$REQUEST_FILE")"
+          if [[ "$COUNT" -lt 1 ]]; then
+            echo 'attachmentIds must be a non-empty array.' >&2
+            exit 1
+          fi
+          jq -e '.attachmentIds | all(test("^att[0-9]+$"))' "$REQUEST_FILE" >/dev/null
+          echo "request_file=$REQUEST_FILE" >> "$GITHUB_OUTPUT"
+          echo "content_id=$CONTENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Atlassian secrets
+        shell: bash
+        env:
+          ATLASSIAN_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          ATLASSIAN_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          for name in ATLASSIAN_BASE_URL ATLASSIAN_EMAIL ATLASSIAN_API_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Download Confluence attachments
+        shell: bash
+        env:
+          ATLASSIAN_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          ATLASSIAN_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          ATLASSIAN_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          CONTENT_ID: ${{ steps.request.outputs.content_id }}
+          REQUEST_FILE: ${{ steps.request.outputs.request_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          echo '[]' > out/manifest.json
+
+          while IFS= read -r ATTACHMENT_ID; do
+            NUMERIC_ID="${ATTACHMENT_ID#att}"
+            META_FILE="out/${ATTACHMENT_ID}-metadata.json"
+            META_URL="${ATLASSIAN_BASE_URL%/}/wiki/api/v2/attachments/${NUMERIC_ID}"
+
+            curl --fail --silent --show-error --location \
+              --retry 3 --retry-delay 1 \
+              --user "$ATLASSIAN_EMAIL:$ATLASSIAN_API_TOKEN" \
+              --header 'Accept: application/json' \
+              "$META_URL" > "$META_FILE"
+
+            FILENAME="$(jq -r '.title // empty' "$META_FILE")"
+            MIME_TYPE="$(jq -r '.mediaType // empty' "$META_FILE")"
+            DOWNLOAD_LINK="$(jq -r '._links.download // .downloadLink // empty' "$META_FILE")"
+            if [[ -z "$DOWNLOAD_LINK" ]]; then
+              DOWNLOAD_LINK="/wiki/rest/api/content/${CONTENT_ID}/child/attachment/${ATTACHMENT_ID}/download"
+            elif [[ "$DOWNLOAD_LINK" != /wiki/* ]]; then
+              DOWNLOAD_LINK="/wiki${DOWNLOAD_LINK}"
+            fi
+            if [[ -z "$FILENAME" ]]; then
+              FILENAME="confluence-${ATTACHMENT_ID}"
+            fi
+            SAFE_FILENAME="$(basename "$FILENAME")"
+
+            curl --fail --silent --show-error --location \
+              --retry 3 --retry-delay 1 \
+              --user "$ATLASSIAN_EMAIL:$ATLASSIAN_API_TOKEN" \
+              "${ATLASSIAN_BASE_URL%/}${DOWNLOAD_LINK}" \
+              --output "out/${ATTACHMENT_ID}__${SAFE_FILENAME}"
+
+            jq --arg contentId "$CONTENT_ID" \
+               --arg attachmentId "$ATTACHMENT_ID" \
+               --arg filename "${ATTACHMENT_ID}__${SAFE_FILENAME}" \
+               --arg mimeType "$MIME_TYPE" \
+               '. + [{contentId:$contentId,attachmentId:$attachmentId,filename:$filename,mimeType:$mimeType}]' \
+               out/manifest.json > out/manifest.tmp
+            mv out/manifest.tmp out/manifest.json
+          done < <(jq -r '.attachmentIds[]' "$REQUEST_FILE")
+
+      - name: Upload batch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: confluence-batch-${{ steps.request.outputs.content_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 1

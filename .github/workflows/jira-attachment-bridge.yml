@@ -1,0 +1,128 @@
+name: Jira Attachment Bridge
+
+on:
+  push:
+    paths:
+      - 'requests/*.json'
+  workflow_dispatch:
+    inputs:
+      attachment_id:
+        description: 'Jira attachment ID'
+        required: true
+        type: string
+      issue_key:
+        description: 'Optional Jira issue key'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download-jira-attachment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve request
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ATTACHMENT_ID='${{ inputs.attachment_id }}'
+            ISSUE_KEY='${{ inputs.issue_key }}'
+          else
+            REQUEST_FILE="$(git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}" -- 'requests/*.json' | tail -n 1)"
+            if [[ -z "$REQUEST_FILE" || ! -f "$REQUEST_FILE" ]]; then
+              echo 'No request JSON found in triggering commit.' >&2
+              exit 1
+            fi
+            ATTACHMENT_ID="$(jq -r '.attachmentId // empty' "$REQUEST_FILE")"
+            ISSUE_KEY="$(jq -r '.issueKey // empty' "$REQUEST_FILE")"
+          fi
+
+          if [[ ! "$ATTACHMENT_ID" =~ ^[0-9]+$ ]]; then
+            echo 'attachmentId must be numeric.' >&2
+            exit 1
+          fi
+
+          echo "attachment_id=$ATTACHMENT_ID" >> "$GITHUB_OUTPUT"
+          echo "issue_key=$ISSUE_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Jira secrets
+        shell: bash
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          for name in JIRA_BASE_URL JIRA_EMAIL JIRA_API_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Download Jira attachment
+        id: download
+        shell: bash
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ATTACHMENT_ID: ${{ steps.request.outputs.attachment_id }}
+          ISSUE_KEY: ${{ steps.request.outputs.issue_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          META_URL="${JIRA_BASE_URL%/}/rest/api/3/attachment/${ATTACHMENT_ID}"
+          CONTENT_URL="${JIRA_BASE_URL%/}/rest/api/3/attachment/content/${ATTACHMENT_ID}"
+
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-delay 1 \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            --header 'Accept: application/json' \
+            "$META_URL" > out/attachment-metadata.json
+
+          FILENAME="$(jq -r '.filename // empty' out/attachment-metadata.json)"
+          MIME_TYPE="$(jq -r '.mimeType // empty' out/attachment-metadata.json)"
+
+          if [[ -z "$FILENAME" ]]; then
+            FILENAME="attachment-${ATTACHMENT_ID}"
+          fi
+
+          SAFE_FILENAME="$(basename "$FILENAME")"
+
+          curl --fail --silent --show-error --location \
+            --retry 3 --retry-delay 1 \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            "$CONTENT_URL" \
+            --output "out/$SAFE_FILENAME"
+
+          jq -n \
+            --arg issueKey "$ISSUE_KEY" \
+            --arg attachmentId "$ATTACHMENT_ID" \
+            --arg filename "$SAFE_FILENAME" \
+            --arg mimeType "$MIME_TYPE" \
+            --arg source "${JIRA_BASE_URL%/}" \
+            '{issueKey:$issueKey, attachmentId:$attachmentId, filename:$filename, mimeType:$mimeType, source:$source}' \
+            > out/manifest.json
+
+          echo "filename=$SAFE_FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload attachment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jira-attachment-${{ steps.request.outputs.attachment_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
